@@ -1,0 +1,249 @@
+
+#include <cpu_defines.h>
+#include <asm-offsets.h>
+#include <platform_asm.h>
+
+.text
+.global __stack
+.global __irq_stack
+.global __supervisor_stack
+.global __abort_stack
+.global __fiq_stack
+.global __undef_stack
+.global __mon_stack
+.globl _reset_handler
+_reset_handler:
+
+	/** Run CPU0 and stuck other CPUs */
+	bl	get_cpu_id
+	cmp	r0, #0		@ CPU0?
+	bne	__stuck_loop
+
+__start_secure_core:
+	/*
+	 * 32bit entry is expected to execute Supervisor mode,
+	 * some bootloader may enter in Supervisor or Monitor
+	 */
+	cps	#SUPERVISOR_MODE
+
+/**
+ * Cortex A9 early configuration:
+ *
+ * - use registers R0-R3;
+ * - no stack usage;
+ * - LR store return address;
+ * - Trap CPU in case of error.
+ */
+/**plat_cpu_reset_early: */
+__setup_CPU:
+	/**TODO: FIXME!
+	 * Configure SCTLR(System Control Register):
+	 * SCTLR = 0x00004000
+	 * - Round-Robin replac. for icache, btac, i/duTLB (bit14: RoundRobin)
+	 */
+	mrc	p15, 0, r1, c1, c0, 0			@ Read SCTLR
+	bic	r1, r1, #0x10000000			@ Clear TEX bit
+	bic	r1, r1, #0x00002000			@ Clear Vectors bit /*Normal exception vectors base address 0x00000000*/
+	mcr	p15, 0, r1, c1, c0, 0			@ Write SCTLR
+
+	/**TODO: FIXME!
+	 * Configure NSACR(Non-secure Access Control Register):
+	 * NSACR = 0x00020C00
+	 * - NSec cannot change ACTRL.SMP (NS_SMP bit18=0)
+	 * - Nsec can lockdown TLB (TL bit17=1)
+	 * - NSec cannot access PLE (PLE bit16=0)
+	 * - NSec can use SIMD/VFP (CP10/CP11) (bit15:14=2b00, bit11:10=2b11)
+	 */
+	mrc	p15, 0, r1, c1, c1, 2			@ Read NSACR
+	ldr	r2, =NSACR_REG_VAL			/*set bit 18,17,11,10*/
+	orr	r1, r1, r2				@ Mask r1 with r2
+	mcr	p15, 0, r1, c1, c1, 2			@ Write NSACR
+
+	/**TODO: FIXME!
+	 * Configure SCR(Secure Configuration Register):
+	 * - Disallow NSec to mask FIQ [bit4: FW=0]
+	 * - Allow NSec to manage Imprecise Abort [bit5: AW=1]
+	 * - Imprecise Abort trapped to Abort Mode [bit3: EA=0]
+	 * - In Sec world, FIQ trapped to FIQ Mode [bit2: FIQ=0]
+	 * - IRQ always trapped to IRQ Mode [bit1: IRQ=0]
+	 * - Secure World [bit0: NS=0]
+	 */
+	mrc	p15, 0, r1, c1, c1, 0			@ Read SCR
+	bic  	r1, r1, #SCR_FIQ_BIT			@ Clear FIQ bit (disable route FIQs monitor)
+	mcr	p15, 0, r1, c1, c1, 0			@ Write SCR
+
+	/**TODO: FIXME!
+	 * Configure ACTLR (Auxiliary Control register):
+	 * ACTRL = 0x00000041
+	 * - core always in full SMP (FW bit0=1, SMP bit6=1)
+	 * - L2 write full line of zero disabled (bit3=0)
+	 *   (keep WFLZ low. Will be set once outer L2 is ready)
+	 */
+	mrc	p15, 0, r0, c1, c0, 1			@ Read ACTLR
+	ldr  	r0, =0x00				@ Clear registers
+	mcr	p15, 0, r0, c1, c0, 1			@ Write ACTLR
+
+	/**TODO: FIXME!
+	 * Configure PCR:
+	 * PCR = 0x00000001
+	 * - no change latency, enable clk gating
+	 */
+	@mov_imm r0, 0x00000001
+	@write_pcr r0
+
+	/**TODO: CHECK!!
+	 * Setup some core configuration in CP15 SCTLR:
+	 * Setup required by current implementation of the OP-TEE core:
+	 * - Disable data and instruction cache.
+	 * - MMU is expected off and exceptions trapped in ARM mode.
+	 * - Enable or disable alignment checks upon platform configuration.
+	 * - Optinally enable write-implies-execute-never.
+	 * - Optinally enable round robin strategy for cache replacement.
+	 */
+	@set_sctlr
+	mrc	p15, 0, r1, c1, c0, 0			@ Read SCTLR
+	bic	r0, r0, #(SCTLR_M | SCTLR_C)
+	bic	r0, r0, #SCTLR_I
+	bic	r0, r0, #SCTLR_TE
+	bic	r0, r0, #SCTLR_A
+	orr	r0, r0, #(SCTLR_WXN | SCTLR_UWXN)
+	orr	r0, r0, #SCTLR_RR
+	mcr	p15, 0, r1, c1, c0, 0			@ Write SCTLR
+
+	isb
+
+	/** Set secure vector table (VBAR) */
+	@ Init
+@	ldr	r0, =_secure_vector_table		@ Read the Secure Vector Table's Base Address
+@	mcr	p15, 0, r0, c12, c0, 0			@ Write VBAR
+
+	/** Set monitor vector table (MVBAR) */
+	ldr	r0, =_monitor_vector_table		@ Read the Monitor Vector Table's Base Address
+	mcr	p15, 0, r0, c12, c0, 1			@ Write MVBAR
+
+
+	/** Setup Stacks for all CPU modes */
+__setup_stacks:
+	/* Get CPU id*/
+	bl	get_cpu_id
+	/* Trap into IRQ mode */
+	msr	cpsr_c,#(IRQ_MODE | IRQ_BIT | FIQ_BIT)		@ Change CPSR to Irq MODE and disable FIQ and IRQ
+	ldr	r1,=__irq_stack
+	/* Trap into FIQ mode */
+	msr	cpsr_c,#(FIQ_MODE | IRQ_BIT | FIQ_BIT)		@ Change CPSR to Fiq MODE and disable FIQ and IRQ
+	ldr	r1,=__fiq_stack
+	@add	r1, r1, r0, lsl #STACK_SIZE_SHIFT			/*useless for single core*/
+	@add	sp, r1, #STACK_SIZE
+	/* ABORT mode */
+	msr	cpsr_c,#(ABORT_MODE | IRQ_BIT | FIQ_BIT)	@ Change CPSR to Abort MODE and disable FIQ and IRQ
+	ldr	r1,=__abort_stack
+	@add	r1, r1, r0, lsl #STACK_SIZE_SHIFT
+	@add	sp, r1, #STACK_SIZE
+	/* UNDEFINED mode */
+	msr	cpsr_c,#(UNDEFINED_MODE | IRQ_BIT | FIQ_BIT)	@ Change CPSR to Undefined MODE and disable FIQ and IRQ
+	ldr	r1,=__undef_stack
+	@add	r1, r1, r0, lsl #STACK_SIZE_SHIFT
+	@add	sp, r1, #STACK_SIZE
+	/* SYSTEM mode */
+	msr	cpsr_c,#(SYSTEM_MODE | IRQ_BIT | FIQ_BIT)	@ Change CPSR to System MODE and disable FIQ and IRQ interrupts
+	ldr	r1,=__stack
+	@add	r1, r1, r0, lsl #STACK_SIZE_SHIFT
+	@add	sp, r1, #STACK_SIZE
+	/* MONITOR mode */
+	msr	cpsr_c,#(MONITOR_MODE | IRQ_BIT | FIQ_BIT)	@ Change CPSR to Monitor MODE and disable only IRQ interrupts
+	ldr	r1,=__mon_stack
+	@add	r1, r1, r0, lsl #STACK_SIZE_SHIFT
+	@add	sp, r1, #STACK_SIZE
+
+
+	/** Handling cache and MMU subsystems */
+__init_vmemory:
+	/* Disable MMU */
+	mrc 	p15, 0, r1, c1, c0, 0			@ Read SCTLR register
+	bic 	r1, r1, #SCTLR_MMU_BIT			@ Clear M bit (disable MMU)
+	mcr 	p15, 0, r1, c1, c0, 0			@ Write SCTLR register
+	/* Disable L1 Caches */
+	mrc 	p15, 0, r1, c1, c0, 0			@ Read SCTLR register
+	bic 	r1, r1, #SCTLR_DCACHE_BIT		@ Clear C bit (disable D-Cache)
+	bic 	r1, r1, #SCTLR_ICACHE_BIT		@ Clear I bit (disable I-Cache)
+	mcr 	p15, 0, r1, c1, c0, 0			@ Write SCTLR register
+	/* Invalidate Instruction cache */
+	mov 	r1,#0
+	mcr 	p15, 0, r1, c7, c5, 0			@ Instruction Cache Invalidate All
+	/* Invalidate Data caches */
+	@mov	r0, #1
+	@bl	data_cache_clean_invalidate_all		@ Invalidate data cache
+	/* Invalidate Branch Predictor arrays */
+	mov 	r1,#0
+	mcr	p15, 0, r1, c7, c5, 6			@ Invalidate BP
+	/* Invalidate TLBs */
+	mov 	r1, #0x0
+	mcr 	p15, 0, r1, c8, c3, 0			@ Invalidate entire unified TLB Inner Shareable
+
+
+	/** Handling VFP and NEON */
+__init_vfp:
+	/* TODO:FIX IT */
+
+
+	/** Initializing C environment */
+__init_c_env:
+	bl	c_environment_init		@TODO:???
+
+
+	/**  Call Main */
+__call_main:
+//.globl cpu_init
+	//bl	cpu_init				@@@ Jump to Operating System 'c' entry function
+.globl ltzvisor_main
+	bl	ltzvisor_main				@ Jump to LTZVisor entry function
+	/* This point should never be reached */
+	b	.
+
+
+/**
+ * Stuck other CPUs than CPU0
+ *
+ * @param
+ *
+ * @retval
+ */
+__stuck_loop:
+	b	__stuck_loop
+
+/**
+ * Get CPU id
+ *
+ * @param
+ *
+ * @retval 	r0 - CPU id
+ */
+.global get_cpu_id
+.func get_cpu_id
+  @ uint32_t get_cpu_id(void)
+get_cpu_id:
+	mrc	p15, 0, r0, c0, c0, 5
+	and	r0, r0, #0x03
+	bx	lr
+.endfunc
+
+/**
+ * Initializing C environment
+ *
+ * @param
+ *
+ * @retval
+ */
+.globl c_environment_init
+c_environment_init:
+	/* bss initialization (zeros) */
+	ldr	r1, =__bss_start		@???
+	ldr	r2, =__bss_end			@???
+	mov	r0, #0
+2:
+	cmp	r1, r2
+	bgt	1f
+	str	r0,	[r1], #4
+	b	2b
+1:
+	mov		pc, lr
